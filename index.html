@@ -531,6 +531,27 @@
   .jf-scope-btn.active { border-color: var(--indigo); background: color-mix(in srgb, var(--indigo) 10%, transparent); }
   .jf-scope-btn.active strong { color: var(--indigo); }
 
+
+  /* ---------- cloud sync ---------- */
+  .jf-cloud-pill { position: fixed; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom, 0px)); z-index: 45; display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: var(--surface); color: var(--ink-soft); border: 1px solid var(--line); border-radius: 2px; font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: 11px; line-height: 1; }
+  .jf-cloud-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-soft); flex-shrink: 0; }
+  .jf-cloud-pill[data-status="ok"] .jf-cloud-dot { background: var(--moss); }
+  .jf-cloud-pill[data-status="syncing"] .jf-cloud-dot, .jf-cloud-pill[data-status="waiting"] .jf-cloud-dot, .jf-cloud-pill[data-status="paused"] .jf-cloud-dot { background: var(--ochre); }
+  .jf-cloud-pill[data-status="error"] .jf-cloud-dot { background: var(--hanko); }
+  .jf-cloud-pill[data-status="error"] { color: var(--hanko); border-color: var(--hanko); }
+  .jf-cloud-menu { position: fixed; right: 12px; bottom: calc(48px + env(safe-area-inset-bottom, 0px)); z-index: 46; width: min(300px, calc(100vw - 24px)); background: var(--surface); color: var(--ink); border: 1px solid var(--line); border-radius: 2px; padding: 12px; box-shadow: 0 6px 20px rgba(0,0,0,.18); }
+  .jf-cloud-overlay { position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,.65); display: flex; align-items: center; justify-content: center; padding: 16px; padding-top: calc(16px + env(safe-area-inset-top, 0px)); padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px)); overflow-y: auto; }
+  .jf-cloud-box { background: var(--surface); color: var(--ink); border: 1px solid var(--line); border-radius: 2px; width: 100%; max-width: 420px; padding: 20px; margin: auto; }
+  .jf-cloud-title { font-size: 20px; margin: 0 0 8px; }
+  .jf-cloud-text { font-size: 13px; line-height: 1.45; color: var(--ink-soft); margin: 0 0 10px; }
+  .jf-cloud-error { font-size: 13px; line-height: 1.45; color: var(--hanko); margin: 0 0 10px; }
+  .jf-cloud-label { display: block; font-size: 11px; color: var(--ink-soft); margin: 0 0 12px; }
+  .jf-cloud-input { display: block; width: 100%; margin-top: 4px; padding: 10px; font-size: 16px; background: var(--surface-2); color: var(--ink); border: 1px solid var(--line); border-radius: 2px; }
+  .jf-cloud-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+  .jf-cloud-option { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
+  .jf-cloud-option .btn { margin-bottom: 6px; }
+  .jf-cloud-later { margin-top: 12px; }
+  @media print { .jf-cloud-pill, .jf-cloud-menu, .jf-cloud-overlay { display: none !important; } }
 </style>
 </head>
 <body>
@@ -1910,6 +1931,7 @@
   function persistSavedViews() {
     try {
       localStorage.setItem(VIEWS_KEY, JSON.stringify(state.savedViews));
+      cloudLocalChanged();
       return true;
     } catch (e) {
       // Quota is the only realistic failure here, and it must not look like
@@ -2248,8 +2270,7 @@
       // Persist normalization results, but never overwrite the existing
       // automatic backup on load - otherwise the backup can only ever mirror
       // the current data and is useless for recovery.
-      if (migratedFromLegacy) persistEntries();
-      else persistEntries({ skipBackup: true });
+      (migratedFromLegacy ? persistEntries() : persistEntries({ skipBackup: true })).then(cloudDataReady);
       render();
     }).catch(function() { render(); });
     render();
@@ -2387,6 +2408,7 @@
       })
       .then(function() {
         refreshMapIfOpen();
+        cloudLocalChanged();
       })
       .catch(function() {
         // Surface write failures instead of failing silently.
@@ -8692,6 +8714,7 @@ function renderViewModal() {
       storageBytesDirty = true;
       pruneSelectedIds();
       return Promise.all([dbSaveAll(state.entries), dbSaveAllLists(state.lists), dbSaveAllProducts(state.products), dbSaveAllRelationships(state.relationships), dbSaveAllCategories(state.categories)]).then(function() {
+        cloudLocalChanged();
         state.backupInfo = { savedAt: backup.savedAt, count: state.entries.length };
         state.backupWorking = false;
         state.importMessage = "Restored " + state.entries.length + " entries from the automatic backup.";
@@ -10819,6 +10842,706 @@ function renderViewModal() {
       }
     }
   });
+
+
+  // ===================== Cloud sync (Supabase) =====================
+  // Local storage (IndexedDB) stays the working copy. Every local save is
+  // compared with what was last synced; changed records are pushed, and the
+  // cloud is checked for changes made on other devices. Photos are stored
+  // once each in the "photos" bucket and referenced from records by hash.
+  var SB_URL = "https://leyswqcqqglvczyoxgdh.supabase.co";
+  var SB_KEY = "sb_publishable_EMi65sVIE4-uIbLw9GFhXQ_HwelHrey";
+  var SB_TABLE = "app_records";
+  var SB_BUCKET = "photos";
+  var SB_SESSION_KEY = "japan-finds-cloud-session-v1";
+  var SB_STATE_PREFIX = "japan-finds-cloud-sync-v1:";
+  var PHOTO_REF_PREFIX = "sbphoto:";
+  var CLOUD_REF_RE = /^sbphoto:[0-9a-f]{64}\.[a-z0-9]+$/;
+  var CLOUD_PHOTO_RE = /^data:(image\/[a-z0-9.+-]+);base64,/i;
+  var CLOUD_DROP = {};
+  var GC_MIN_AGE_MS = 7 * 24 * 3600 * 1000;
+  var GC_INTERVAL_MS = 24 * 3600 * 1000;
+
+  var cloud = {
+    session: null, dataReady: false, running: false, rerun: false, applying: false,
+    timer: null, status: "off", statusDetail: "", lastSyncedAt: 0,
+    hashCache: new Map(), refToData: new Map(), firstDeferred: false,
+    pill: null, menu: null
+  };
+
+  var CLOUD_COLLECTIONS = [
+    { name: "entries", get: function () { return state.entries; },
+      set: function (a) { state.entries = a.map(normalizeEntry).filter(Boolean).sort(function (x, y) { return (y.dateAdded || 0) - (x.dateAdded || 0); }); } },
+    { name: "lists", get: function () { return state.lists; },
+      set: function (a) { state.lists = a.map(normalizeList).filter(Boolean); ensureFavouritesList(); } },
+    { name: "products", get: function () { return state.products; },
+      set: function (a) { state.products = a.map(normalizeProduct).filter(Boolean); assignMissingProductOrder(); } },
+    { name: "relationships", get: function () { return state.relationships; },
+      set: function (a) { state.relationships = a.filter(function (r) { return r && typeof r === "object"; }); } },
+    { name: "categories", get: function () { return state.categories; },
+      set: function (a) { var c = a.map(normalizeCategory).filter(Boolean); if (!c.length) c = seedCategories(); state.categories = c; syncCategoryIndexes(); } },
+    { name: "notes", get: function () { return state.notes; },
+      set: function (a) { state.notes = a.map(normalizeNote).filter(Boolean); } },
+    { name: "views", get: function () { return state.savedViews; },
+      set: function (a) {
+        state.savedViews = a.map(normalizeView).filter(Boolean);
+        try { localStorage.setItem(VIEWS_KEY, JSON.stringify(state.savedViews)); } catch (e) {}
+        if (state.activeViewId && !state.savedViews.some(function (v) { return v.id === state.activeViewId; })) state.activeViewId = null;
+      } }
+  ];
+  function cloudCollection(name) { for (var i = 0; i < CLOUD_COLLECTIONS.length; i++) if (CLOUD_COLLECTIONS[i].name === name) return CLOUD_COLLECTIONS[i]; return null; }
+  function cloudKey(col, id) { return col + "|" + String(id); }
+  function cloudSplit(key) { var i = key.indexOf("|"); return [key.slice(0, i), key.slice(i + 1)]; }
+  function cloudErr(msg, kind, status) { var e = new Error(msg); e.kind = kind; e.status = status; return e; }
+  function cloudSupported() { return !!(window.crypto && window.crypto.subtle && window.TextEncoder && window.fetch && window.Map && window.Set); }
+
+  // ---------- session ----------
+  function cloudLoadSession() {
+    try {
+      var s = JSON.parse(localStorage.getItem(SB_SESSION_KEY) || "null");
+      return s && s.access_token && s.refresh_token && s.user && s.user.id ? s : null;
+    } catch (e) { return null; }
+  }
+  function cloudSaveSession(s) {
+    cloud.session = s;
+    try { if (s) localStorage.setItem(SB_SESSION_KEY, JSON.stringify(s)); else localStorage.removeItem(SB_SESSION_KEY); } catch (e) {}
+  }
+  function cloudSessionFrom(d) {
+    return {
+      access_token: d.access_token, refresh_token: d.refresh_token,
+      expires_at: d.expires_at || (Math.floor(Date.now() / 1000) + (d.expires_in || 3600)),
+      user: { id: d.user.id, email: d.user.email }
+    };
+  }
+
+  // ---------- network ----------
+  function cloudFetch(url, opts) {
+    return fetch(url, opts).catch(function () { throw cloudErr("Can't reach the sync server.", "offline"); });
+  }
+  async function cloudAuthRequest(grant, body) {
+    var res = await cloudFetch(SB_URL + "/auth/v1/token?grant_type=" + grant, {
+      method: "POST", headers: { "apikey": SB_KEY, "Content-Type": "application/json" }, body: JSON.stringify(body)
+    });
+    var data = null; try { data = await res.json(); } catch (e) {}
+    if (!res.ok) {
+      var msg = (data && (data.msg || data.error_description || data.message || data.error)) || ("Sign-in failed (" + res.status + ")");
+      throw cloudErr(msg, res.status >= 500 ? "http" : "auth", res.status);
+    }
+    return data;
+  }
+  var cloudRefreshing = null;
+  function cloudEnsureToken(force) {
+    var s = cloud.session;
+    if (!s) return Promise.reject(cloudErr("Not signed in.", "auth"));
+    if (!force && s.expires_at * 1000 - 60000 > Date.now()) return Promise.resolve(s.access_token);
+    if (!cloudRefreshing) {
+      cloudRefreshing = cloudAuthRequest("refresh_token", { refresh_token: s.refresh_token }).then(function (d) {
+        cloudSaveSession(cloudSessionFrom(d));
+        return cloud.session.access_token;
+      }, function (e) {
+        if (e.kind === "auth") cloudSignedOut("Your sign-in expired. Sign in again to keep syncing.");
+        throw e;
+      }).finally(function () { cloudRefreshing = null; });
+    }
+    return cloudRefreshing;
+  }
+  async function cloudApi(path, opts, retried) {
+    opts = opts || {};
+    var token = await cloudEnsureToken(false);
+    var headers = Object.assign({ "apikey": SB_KEY, "Authorization": "Bearer " + token }, opts.headers || {});
+    var res = await cloudFetch(SB_URL + path, { method: opts.method || "GET", headers: headers, body: opts.body });
+    if (res.status === 401 && !retried) { await cloudEnsureToken(true); return cloudApi(path, opts, true); }
+    if (!res.ok && !(opts.allow && opts.allow.indexOf(res.status) !== -1)) {
+      var t = ""; try { t = await res.text(); } catch (e) {}
+      var m = t; try { var j = JSON.parse(t); m = j.message || j.msg || j.error || t; } catch (e) {}
+      throw cloudErr("Sync server error " + res.status + (m ? ": " + String(m).slice(0, 200) : ""), "http", res.status);
+    }
+    return res;
+  }
+  function cloudInList(ids) {
+    return "in.(" + ids.map(function (id) { return '"' + String(id).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"'; }).join(",") + ")";
+  }
+  async function cloudPool(items, n, fn) {
+    var i = 0, workers = [];
+    for (var w = 0; w < Math.min(n, items.length); w++) {
+      workers.push((async function () { while (i < items.length) { var it = items[i++]; await fn(it); } })());
+    }
+    await Promise.all(workers);
+  }
+
+  // ---------- record forms and hashing ----------
+  function cloudCanon(v) {
+    if (v === null || v === undefined || typeof v === "function") return "null";
+    if (typeof v === "number") return isFinite(v) ? JSON.stringify(v) : "null";
+    if (typeof v !== "object") return JSON.stringify(v);
+    if (typeof v.toJSON === "function") return cloudCanon(v.toJSON());
+    if (Array.isArray(v)) return "[" + v.map(cloudCanon).join(",") + "]";
+    var keys = Object.keys(v).filter(function (k) { var x = v[k]; return x !== undefined && typeof x !== "function"; }).sort();
+    return "{" + keys.map(function (k) { return JSON.stringify(k) + ":" + cloudCanon(v[k]); }).join(",") + "}";
+  }
+  function cloudHash(str) {
+    var h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (var i = 0, ch; i < str.length; i++) {
+      ch = str.charCodeAt(i);
+      h1 = Math.imul(h1 ^ ch, 2654435761);
+      h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507); h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507); h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36) + ":" + str.length.toString(36);
+  }
+  function cloudEach(v, fn) {
+    if (typeof v === "string") { fn(v); return; }
+    if (v === null || typeof v !== "object") return;
+    if (Array.isArray(v)) { for (var i = 0; i < v.length; i++) cloudEach(v[i], fn); return; }
+    for (var k in v) if (Object.prototype.hasOwnProperty.call(v, k)) cloudEach(v[k], fn);
+  }
+  function cloudMap(v, fn) {
+    if (typeof v === "string") return fn(v);
+    if (v === null || typeof v !== "object") return v;
+    if (typeof v.toJSON === "function") return cloudMap(v.toJSON(), fn);
+    if (Array.isArray(v)) {
+      var out = [];
+      for (var i = 0; i < v.length; i++) { var r = cloudMap(v[i], fn); if (r !== CLOUD_DROP) out.push(r); }
+      return out;
+    }
+    var o = {};
+    Object.keys(v).forEach(function (k) { var r = cloudMap(v[k], fn); o[k] = r === CLOUD_DROP ? "" : r; });
+    return o;
+  }
+  function cloudIsPhoto(s) { return s.length > 1500 && CLOUD_PHOTO_RE.test(s.slice(0, 80)); }
+  function cloudPhotoExt(mime) {
+    var sub = mime.split("/")[1].toLowerCase();
+    if (sub === "jpeg") return "jpg";
+    if (sub === "svg+xml") return "svg";
+    return sub.replace(/[^a-z0-9]/g, "") || "img";
+  }
+  function cloudMimeFromRef(ref) {
+    var ext = ref.slice(ref.lastIndexOf(".") + 1);
+    if (ext === "jpg") return "image/jpeg";
+    if (ext === "svg") return "image/svg+xml";
+    return "image/" + ext;
+  }
+  async function cloudPhotoRef(s) {
+    var hit = cloud.hashCache.get(s);
+    if (hit) return hit;
+    var mime = CLOUD_PHOTO_RE.exec(s.slice(0, 80))[1].toLowerCase();
+    var buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+    var hex = Array.prototype.map.call(new Uint8Array(buf), function (b) { return ("0" + b.toString(16)).slice(-2); }).join("");
+    var ref = PHOTO_REF_PREFIX + hex + "." + cloudPhotoExt(mime);
+    cloud.hashCache.set(s, ref);
+    cloud.refToData.set(ref, s);
+    return ref;
+  }
+  // The copy of a record that goes to the cloud: photos replaced by references.
+  async function cloudForm(rec, seenPhotos) {
+    var photos = [];
+    cloudEach(rec, function (s) { if (cloudIsPhoto(s)) photos.push(s); });
+    for (var i = 0; i < photos.length; i++) {
+      var r = await cloudPhotoRef(photos[i]);
+      if (seenPhotos) seenPhotos.set(photos[i], r);
+    }
+    return cloudMap(rec, function (s) {
+      if (cloudIsPhoto(s)) return cloud.hashCache.get(s);
+      return s.indexOf("\u0000") !== -1 ? s.replace(/\u0000/g, "") : s;
+    });
+  }
+  function cloudFindRecord(colName, id) {
+    var col = cloudCollection(colName); if (!col) return null;
+    var arr = col.get() || [];
+    for (var i = 0; i < arr.length; i++) if (arr[i] && arr[i].id !== undefined && arr[i].id !== null && String(arr[i].id) === id) return arr[i];
+    return null;
+  }
+
+  // ---------- per-user sync bookkeeping ----------
+  // meta[key]  = { h: hash of the record as last synced, u: cloud updated_at (ms) }
+  // dirty[key] = { t: when this device changed it, h: hash, del: deleted locally }
+  function cloudStateKey() { return SB_STATE_PREFIX + cloud.session.user.id; }
+  function cloudLoadState() {
+    var s = null;
+    try { s = JSON.parse(localStorage.getItem(cloudStateKey()) || "null"); } catch (e) {}
+    s = s || {};
+    s.meta = s.meta || {}; s.dirty = s.dirty || {}; s.up = s.up || {};
+    return s;
+  }
+  function cloudSaveState(s) {
+    try { localStorage.setItem(cloudStateKey(), JSON.stringify(s)); }
+    catch (e) { throw cloudErr("Couldn't save sync progress on this device. Browser storage may be full.", "local"); }
+  }
+
+  // ---------- local change detection ----------
+  async function cloudDetect(st) {
+    var now = Date.now(), seen = {}, seenPhotos = new Map();
+    for (var c = 0; c < CLOUD_COLLECTIONS.length; c++) {
+      var col = CLOUD_COLLECTIONS[c], arr = col.get() || [];
+      for (var i = 0; i < arr.length; i++) {
+        var rec = arr[i];
+        if (!rec || typeof rec !== "object" || rec.id === undefined || rec.id === null || rec.id === "") continue;
+        var key = cloudKey(col.name, rec.id);
+        if (seen[key]) continue;
+        seen[key] = 1;
+        var h = cloudHash(cloudCanon(await cloudForm(rec, seenPhotos)));
+        var m = st.meta[key], d = st.dirty[key];
+        if (m && m.h === h) { if (d) delete st.dirty[key]; continue; }
+        if (!d || d.del || d.h !== h) st.dirty[key] = { t: now, h: h };
+      }
+    }
+    Object.keys(st.meta).concat(Object.keys(st.dirty)).forEach(function (key) {
+      if (seen[key]) return;
+      if (st.meta[key]) { if (!st.dirty[key] || !st.dirty[key].del) st.dirty[key] = { t: now, del: true }; }
+      else delete st.dirty[key];
+    });
+    var hc = new Map(), rd = new Map();
+    seenPhotos.forEach(function (ref, s) { hc.set(s, ref); rd.set(ref, s); });
+    cloud.hashCache = hc; cloud.refToData = rd;
+  }
+
+  // ---------- cloud reads ----------
+  async function cloudListRows() {
+    var out = new Map(), offset = 0, page = 1000;
+    for (;;) {
+      var res = await cloudApi("/rest/v1/" + SB_TABLE + "?select=collection,record_id,updated_at&order=collection.asc,record_id.asc&limit=" + page + "&offset=" + offset);
+      var rows = await res.json();
+      rows.forEach(function (r) { if (cloudCollection(r.collection)) out.set(cloudKey(r.collection, r.record_id), Date.parse(r.updated_at)); });
+      if (rows.length < page) break;
+      offset += page;
+    }
+    return out;
+  }
+  async function cloudFetchRows(keys) {
+    var byCol = {}, out = [];
+    keys.forEach(function (k) { var p = cloudSplit(k); (byCol[p[0]] = byCol[p[0]] || []).push(p[1]); });
+    for (var col in byCol) {
+      var ids = byCol[col];
+      for (var i = 0; i < ids.length; i += 40) {
+        var res = await cloudApi("/rest/v1/" + SB_TABLE + "?select=collection,record_id,data,updated_at&collection=eq." +
+          encodeURIComponent(col) + "&record_id=" + encodeURIComponent(cloudInList(ids.slice(i, i + 40))));
+        (await res.json()).forEach(function (r) {
+          out.push({ key: cloudKey(r.collection, r.record_id), col: r.collection, data: r.data, u: Date.parse(r.updated_at) });
+        });
+      }
+    }
+    return out;
+  }
+  function cloudPhotoPath(ref) { return cloud.session.user.id + "/" + ref.slice(PHOTO_REF_PREFIX.length); }
+  async function cloudDownloadPhoto(ref) {
+    var res = await cloudApi("/storage/v1/object/authenticated/" + SB_BUCKET + "/" + cloudPhotoPath(ref), { allow: [400, 404] });
+    if (res.status === 404) return null;
+    if (res.status === 400) {
+      var t = ""; try { t = await res.text(); } catch (e) {}
+      if (/not.?found|"404"/i.test(t)) return null;
+      throw cloudErr("Sync server error 400: " + t.slice(0, 200), "http", 400);
+    }
+    var blob = await res.blob();
+    if (!/^image\//.test(blob.type)) blob = new Blob([blob], { type: cloudMimeFromRef(ref) });
+    return await new Promise(function (resolve, reject) {
+      var fr = new FileReader();
+      fr.onload = function () { resolve(fr.result); };
+      fr.onerror = function () { reject(cloudErr("Couldn't read a downloaded photo.", "local")); };
+      fr.readAsDataURL(blob);
+    });
+  }
+  async function cloudResolvePhotos(rows, st) {
+    var need = [], needSet = {};
+    rows.forEach(function (r) {
+      cloudEach(r.data, function (s) {
+        if (CLOUD_REF_RE.test(s) && !cloud.refToData.has(s) && !needSet[s]) { needSet[s] = 1; need.push(s); }
+      });
+    });
+    await cloudPool(need, 4, async function (ref) {
+      var d = await cloudDownloadPhoto(ref);
+      if (d) {
+        cloud.refToData.set(ref, d);
+        cloud.hashCache.set(d, ref);
+        st.up[ref.slice(PHOTO_REF_PREFIX.length)] = 1;
+      }
+    });
+    rows.forEach(function (r) {
+      r.local = cloudMap(r.data, function (s) {
+        if (!CLOUD_REF_RE.test(s)) return s;
+        var d = cloud.refToData.get(s);
+        return d !== undefined ? d : CLOUD_DROP;
+      });
+    });
+  }
+
+  // ---------- cloud writes ----------
+  async function cloudUploadPhoto(ref, st) {
+    var name = ref.slice(PHOTO_REF_PREFIX.length);
+    if (st.up[name]) return;
+    var dataUrl = cloud.refToData.get(ref);
+    if (!dataUrl) throw cloudErr("A photo is missing on this device.", "local");
+    var mime = CLOUD_PHOTO_RE.exec(dataUrl.slice(0, 80))[1].toLowerCase();
+    var blob = await (await fetch(dataUrl)).blob();
+    await cloudApi("/storage/v1/object/" + SB_BUCKET + "/" + cloudPhotoPath(ref), {
+      method: "POST", headers: { "Content-Type": mime, "x-upsert": "true" }, body: blob
+    });
+    st.up[name] = 1;
+  }
+  async function cloudPush(st, keys, cloudRows) {
+    var uid = cloud.session.user.id, now = Date.now(), iso = new Date(now).toISOString();
+    var upRows = [], upKeys = [], delByCol = {}, delKeys = [];
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i], d = st.dirty[key], p = cloudSplit(key);
+      if (!d || !cloudCollection(p[0])) continue;
+      if (d.del) {
+        if (cloudRows.has(key)) (delByCol[p[0]] = delByCol[p[0]] || []).push(p[1]);
+        delKeys.push(key);
+        continue;
+      }
+      var rec = cloudFindRecord(p[0], p[1]);
+      if (!rec) continue;
+      var form = await cloudForm(rec, null);
+      var refs = [];
+      cloudEach(form, function (s) { if (CLOUD_REF_RE.test(s) && refs.indexOf(s) === -1) refs.push(s); });
+      await cloudPool(refs, 3, function (ref) { return cloudUploadPhoto(ref, st); });
+      upRows.push({ user_id: uid, collection: p[0], record_id: p[1], data: form, updated_at: iso });
+      upKeys.push({ key: key, h: cloudHash(cloudCanon(form)) });
+    }
+    for (var j = 0; j < upRows.length; j += 50) {
+      await cloudApi("/rest/v1/" + SB_TABLE + "?on_conflict=user_id,collection,record_id", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(upRows.slice(j, j + 50))
+      });
+      upKeys.slice(j, j + 50).forEach(function (k) { st.meta[k.key] = { h: k.h, u: now }; delete st.dirty[k.key]; });
+      cloudSaveState(st);
+    }
+    for (var col in delByCol) {
+      var ids = delByCol[col];
+      for (var n = 0; n < ids.length; n += 40) {
+        await cloudApi("/rest/v1/" + SB_TABLE + "?collection=eq." + encodeURIComponent(col) + "&record_id=" + encodeURIComponent(cloudInList(ids.slice(n, n + 40))), { method: "DELETE" });
+      }
+    }
+    delKeys.forEach(function (k) { delete st.meta[k]; delete st.dirty[k]; });
+    cloudSaveState(st);
+  }
+
+  // ---------- applying cloud changes on this device ----------
+  async function cloudApply(st, rows, delKeys) {
+    cloud.applying = true;
+    try { await cloudApplyInner(st, rows, delKeys); } finally { cloud.applying = false; }
+  }
+  async function cloudApplyInner(st, rows, delKeys) {
+    CLOUD_COLLECTIONS.forEach(function (col) {
+      var rowsC = rows.filter(function (r) { return r.col === col.name; });
+      var drop = {}, anyDrop = false;
+      delKeys.forEach(function (k) { var p = cloudSplit(k); if (p[0] === col.name) { drop[p[1]] = 1; anyDrop = true; } });
+      if (!rowsC.length && !anyDrop) return;
+      var arr = (col.get() || []).slice(), idx = {};
+      arr.forEach(function (r, i) { if (r && r.id !== undefined && r.id !== null) idx[String(r.id)] = i; });
+      rowsC.forEach(function (r) {
+        var id = cloudSplit(r.key)[1];
+        if (idx[id] !== undefined) arr[idx[id]] = r.local;
+        else { idx[id] = arr.length; arr.push(r.local); }
+      });
+      arr = arr.filter(function (r) { return !(r && r.id !== undefined && r.id !== null && drop[String(r.id)]); });
+      col.set(arr);
+    });
+    for (var i = 0; i < rows.length; i++) {
+      var p = cloudSplit(rows[i].key), rec = cloudFindRecord(p[0], p[1]);
+      st.meta[rows[i].key] = { h: rec ? cloudHash(cloudCanon(await cloudForm(rec, null))) : "", u: rows[i].u };
+      delete st.dirty[rows[i].key];
+    }
+    delKeys.forEach(function (k) { delete st.meta[k]; delete st.dirty[k]; });
+    cloudSaveState(st);
+    try { pruneSelectedIds(); } catch (e) {}
+    await persistEntries({ skipBackup: true });
+    if (!state.modalMode) {
+      if (state.mapMode && googleMap) { renderKeepingMaps(); refreshMapIfOpen(); }
+      else renderPreservingScroll();
+    }
+  }
+
+  async function cloudSnapshotBackup() {
+    var prev = state.backupInfo;
+    state.backupInfo = null; // bypass the age check
+    try { await maybeWriteBackup(); } catch (e) {}
+    if (!state.backupInfo) state.backupInfo = prev;
+  }
+
+  // Remove photo files no record refers to any more. Only runs when this
+  // device has nothing unsynced, and only touches files older than a week, so
+  // a photo another device has just uploaded is never removed.
+  async function cloudMaybeGc(st) {
+    if (Object.keys(st.dirty).length) return;
+    if (Date.now() - (st.lastGc || 0) < GC_INTERVAL_MS) return;
+    var uid = cloud.session.user.id, referenced = new Set(), photos = [];
+    CLOUD_COLLECTIONS.forEach(function (col) { (col.get() || []).forEach(function (r) { cloudEach(r, function (s) { if (cloudIsPhoto(s)) photos.push(s); }); }); });
+    for (var i = 0; i < photos.length; i++) referenced.add((await cloudPhotoRef(photos[i])).slice(PHOTO_REF_PREFIX.length));
+    var objs = [], offset = 0;
+    for (;;) {
+      var res = await cloudApi("/storage/v1/object/list/" + SB_BUCKET, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prefix: uid, limit: 1000, offset: offset, sortBy: { column: "name", order: "asc" } })
+      });
+      var items = await res.json();
+      objs = objs.concat(items);
+      if (items.length < 1000) break;
+      offset += 1000;
+    }
+    var cutoff = Date.now() - GC_MIN_AGE_MS;
+    var del = objs.filter(function (o) { return o && o.id && o.name && !referenced.has(o.name) && Date.parse(o.created_at) < cutoff; })
+      .map(function (o) { return o.name; });
+    for (var j = 0; j < del.length; j += 100) {
+      var chunk = del.slice(j, j + 100);
+      await cloudApi("/storage/v1/object/" + SB_BUCKET, {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prefixes: chunk.map(function (n) { return uid + "/" + n; }) })
+      });
+      chunk.forEach(function (n) { delete st.up[n]; });
+    }
+    st.lastGc = Date.now();
+    cloudSaveState(st);
+  }
+
+  // ---------- the sync run ----------
+  async function cloudRun() {
+    if (cloud.running) { cloud.rerun = true; return; }
+    if (!cloud.session || !cloud.dataReady || !cloudSupported()) return;
+    cloud.running = true;
+    try {
+      var st = cloudLoadState();
+      // Changes are timestamped even when offline, so the newer edit wins later.
+      await cloudDetect(st);
+      cloudSaveState(st);
+      if (!navigator.onLine) { cloudSetStatus("offline"); return; }
+      if (state.modalMode) { cloudSetStatus("waiting"); return; }
+      if (cloud.firstDeferred) { cloudSetStatus("paused"); return; }
+      cloudSetStatus("syncing");
+
+      var rows = await cloudListRows();
+      var keepCloud = false;
+      if (!st.firstDone) {
+        var localHas = ["entries", "products", "notes", "relationships"].some(function (n) { return (state[n] || []).length > 0; });
+        var choice = !rows.size ? "device" : (!localHas ? "cloud" : await cloudAskFirst(rows));
+        if (choice === "later") { cloud.firstDeferred = true; cloudSetStatus("paused"); return; }
+        if (choice === "cloud" || choice === "merge") await cloudSnapshotBackup();
+        if (choice === "cloud") { keepCloud = true; st.dirty = {}; st.meta = {}; }
+        if (choice === "device") {
+          if (rows.size) { await cloudApi("/rest/v1/" + SB_TABLE + "?user_id=eq." + encodeURIComponent(cloud.session.user.id), { method: "DELETE" }); rows = new Map(); }
+          st.meta = {};
+          await cloudDetect(st);
+        }
+        if (choice !== "cloud") st.firstDone = true;
+        cloudSaveState(st);
+      }
+
+      var fetchKeys = [], localDel = [], localDelSet = {};
+      function markLocalDel(k) { if (!localDelSet[k]) { localDelSet[k] = 1; localDel.push(k); } }
+      rows.forEach(function (u, key) {
+        var m = st.meta[key], d = st.dirty[key];
+        if (m && m.u === u) return;     // unchanged in the cloud
+        if (d && d.t > u) return;       // changed here more recently: this device wins
+        fetchKeys.push(key);
+      });
+      if (keepCloud) {
+        CLOUD_COLLECTIONS.forEach(function (col) {
+          (col.get() || []).forEach(function (r) {
+            if (r && r.id !== undefined && r.id !== null) { var k = cloudKey(col.name, r.id); if (!rows.has(k)) markLocalDel(k); }
+          });
+        });
+      }
+      Object.keys(st.meta).forEach(function (key) {
+        if (rows.has(key)) return;
+        var d = st.dirty[key];
+        if (d && !d.del) delete st.meta[key]; // edited here after another device deleted it: keep and re-upload
+        else markLocalDel(key);                // deleted on another device
+      });
+
+      var fetchSet = {};
+      fetchKeys.forEach(function (k) { fetchSet[k] = 1; });
+      var fetched = await cloudFetchRows(fetchKeys);
+      await cloudResolvePhotos(fetched, st);
+      var pushKeys = Object.keys(st.dirty).filter(function (k) { return !fetchSet[k] && !localDelSet[k]; });
+      await cloudPush(st, pushKeys, rows);
+      if (fetched.length || localDel.length) await cloudApply(st, fetched, localDel);
+      st.firstDone = true;
+      cloudSaveState(st);
+      await cloudMaybeGc(st);
+      cloud.lastSyncedAt = Date.now();
+      cloudSetStatus(Object.keys(cloudLoadState().dirty).length ? "syncing" : "ok");
+    } catch (e) {
+      if (e.kind === "offline") cloudSetStatus("offline");
+      else if (e.kind === "auth") { if (cloud.session) cloudSetStatus("error", e.message); }
+      else cloudSetStatus("error", e.message || String(e));
+    } finally {
+      cloud.running = false;
+      if (cloud.rerun) { cloud.rerun = false; cloudSchedule(800); }
+    }
+  }
+  function cloudSchedule(ms) { clearTimeout(cloud.timer); cloud.timer = setTimeout(cloudRun, ms); }
+  function cloudLocalChanged() { if (cloud.applying) return; cloudSchedule(1500); }
+  function cloudDataReady() { cloud.dataReady = true; cloudSchedule(0); }
+
+  // ---------- sign in / out ----------
+  async function cloudSignIn(email, password) {
+    var d = await cloudAuthRequest("password", { email: email, password: password });
+    cloudSaveSession(cloudSessionFrom(d));
+    cloud.firstDeferred = false;
+    cloudSetStatus("syncing");
+    cloudSchedule(0);
+  }
+  function cloudSignOut() {
+    var s = cloud.session;
+    if (s) fetch(SB_URL + "/auth/v1/logout", { method: "POST", headers: { "apikey": SB_KEY, "Authorization": "Bearer " + s.access_token } }).catch(function () {});
+    cloudSaveSession(null);
+    cloud.firstDeferred = false;
+    cloudSetStatus("off");
+  }
+  function cloudSignedOut(message) {
+    cloudSaveSession(null);
+    cloudSetStatus("off");
+    cloudShowSignIn(message);
+  }
+
+  // ---------- UI ----------
+  function cloudEl(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+  function cloudCloseOverlay() { var o = document.querySelector(".jf-cloud-overlay"); if (o) o.remove(); }
+
+  function cloudShowSignIn(message) {
+    cloudCloseOverlay();
+    cloudCloseMenu();
+    var ov = cloudEl("div", "jf-cloud-overlay");
+    var box = cloudEl("form", "jf-cloud-box");
+    box.setAttribute("autocomplete", "on");
+    box.appendChild(cloudEl("h2", "jf-cloud-title", "Sign in to sync"));
+    box.appendChild(cloudEl("p", "jf-cloud-text", "Syncing keeps your collection the same on every device you sign in on."));
+    var msg = cloudEl("p", "jf-cloud-error", message || "");
+    if (!message) msg.hidden = true;
+    var el = cloudEl("label", "jf-cloud-label", "Email");
+    var email = cloudEl("input", "jf-cloud-input"); email.type = "email"; email.name = "email"; email.autocomplete = "username"; email.required = true;
+    el.appendChild(email);
+    var pl = cloudEl("label", "jf-cloud-label", "Password");
+    var pw = cloudEl("input", "jf-cloud-input"); pw.type = "password"; pw.name = "password"; pw.autocomplete = "current-password"; pw.required = true;
+    pl.appendChild(pw);
+    var actions = cloudEl("div", "jf-cloud-actions");
+    var go = cloudEl("button", "btn btn-primary", "Sign in"); go.type = "submit";
+    var skip = cloudEl("button", "btn btn-outline", "Continue without syncing"); skip.type = "button";
+    actions.appendChild(go); actions.appendChild(skip);
+    box.appendChild(msg); box.appendChild(el); box.appendChild(pl); box.appendChild(actions);
+    ov.appendChild(box);
+    document.body.appendChild(ov);
+    skip.onclick = function () { cloudCloseOverlay(); cloudRenderStatus(); };
+    box.onsubmit = function (ev) {
+      ev.preventDefault();
+      go.disabled = true; skip.disabled = true; go.textContent = "Signing in…"; msg.hidden = true;
+      cloudSignIn(email.value.trim(), pw.value).then(function () { cloudCloseOverlay(); }, function (e) {
+        go.disabled = false; skip.disabled = false; go.textContent = "Sign in";
+        msg.textContent = e.kind === "offline" ? "Can't reach the sync server. Check your connection and try again." : (e.message || "Sign-in failed.");
+        msg.hidden = false;
+      });
+    };
+    setTimeout(function () { try { email.focus(); } catch (e) {} }, 0);
+  }
+
+  function cloudAskFirst(rows) {
+    return new Promise(function (resolve) {
+      cloudCloseOverlay();
+      cloudCloseMenu();
+      var cloudEntries = 0;
+      rows.forEach(function (u, k) { if (k.indexOf("entries|") === 0) cloudEntries++; });
+      var ov = cloudEl("div", "jf-cloud-overlay");
+      var box = cloudEl("div", "jf-cloud-box");
+      box.setAttribute("role", "dialog"); box.setAttribute("aria-modal", "true");
+      box.appendChild(cloudEl("h2", "jf-cloud-title", "Choose which data to keep"));
+      box.appendChild(cloudEl("p", "jf-cloud-text", "Your account already has data in the cloud (" + cloudEntries + " entries), and this device has its own (" + (state.entries || []).length + " entries)."));
+      function option(label, desc, value, primary) {
+        var wrap = cloudEl("div", "jf-cloud-option");
+        var b = cloudEl("button", "btn " + (primary ? "btn-primary" : "btn-outline"), label); b.type = "button";
+        b.onclick = function () { cloudCloseOverlay(); resolve(value); };
+        wrap.appendChild(b);
+        wrap.appendChild(cloudEl("p", "jf-cloud-text", desc));
+        box.appendChild(wrap);
+        return b;
+      }
+      var first = option("Keep both", "Combines the two. Where the same item exists in both, this device's version is kept. This device's current data is saved to the automatic backup first.", "merge", true);
+      option("Use the cloud data", "Replaces everything on this device with the cloud copy. This device's current data is saved to the automatic backup first.", "cloud");
+      option("Use this device's data", "Replaces everything in the cloud with this device's data. The cloud copy is deleted.", "device");
+      var later = cloudEl("button", "link-btn jf-cloud-later", "Decide later"); later.type = "button";
+      later.onclick = function () { cloudCloseOverlay(); resolve("later"); };
+      box.appendChild(later);
+      ov.appendChild(box);
+      document.body.appendChild(ov);
+      setTimeout(function () { try { first.focus(); } catch (e) {} }, 0);
+    });
+  }
+
+  var CLOUD_LABELS = {
+    off: "Not syncing", syncing: "Syncing…", ok: "Synced", offline: "Offline, saved on device",
+    waiting: "Changes saved on device", paused: "Sync paused", error: "Sync problem"
+  };
+  function cloudSetStatus(s, detail) { cloud.status = s; cloud.statusDetail = detail || ""; cloudRenderStatus(); }
+  function cloudRenderStatus() {
+    if (!cloud.pill) return;
+    var s = cloud.session ? cloud.status : "off";
+    cloud.pill.setAttribute("data-status", s);
+    cloud.pill.querySelector(".jf-cloud-pill-text").textContent = CLOUD_LABELS[s] || s;
+    if (cloud.menu) cloudFillMenu();
+  }
+  function cloudCloseMenu() { if (cloud.menu) { cloud.menu.remove(); cloud.menu = null; } }
+  function cloudFillMenu() {
+    var m = cloud.menu; m.innerHTML = "";
+    var s = cloud.session;
+    if (!s) {
+      m.appendChild(cloudEl("p", "jf-cloud-text", "This device isn't syncing. Data is saved on this device only."));
+      var si = cloudEl("button", "btn btn-primary btn-sm", "Sign in"); si.type = "button";
+      si.onclick = function () { cloudShowSignIn(); };
+      m.appendChild(si);
+      return;
+    }
+    m.appendChild(cloudEl("p", "jf-cloud-text", "Signed in as " + (s.user.email || "your account")));
+    if (cloud.lastSyncedAt) m.appendChild(cloudEl("p", "jf-cloud-text", "Last synced " + new Date(cloud.lastSyncedAt).toLocaleString()));
+    if (!cloudSupported()) m.appendChild(cloudEl("p", "jf-cloud-error", "Syncing needs the app opened from its https:// web address."));
+    if (cloud.status === "error" && cloud.statusDetail) m.appendChild(cloudEl("p", "jf-cloud-error", cloud.statusDetail));
+    if (cloud.status === "waiting") m.appendChild(cloudEl("p", "jf-cloud-text", "Syncing resumes when the open window is closed."));
+    var row = cloudEl("div", "jf-cloud-actions");
+    if (cloud.status === "paused") {
+      var choose = cloudEl("button", "btn btn-primary btn-sm", "Choose data to keep"); choose.type = "button";
+      choose.onclick = function () { cloud.firstDeferred = false; cloudCloseMenu(); cloudSchedule(0); };
+      row.appendChild(choose);
+    } else {
+      var now = cloudEl("button", "btn btn-primary btn-sm", "Sync now"); now.type = "button";
+      now.onclick = function () { cloudCloseMenu(); cloudSetStatus("syncing"); cloudSchedule(0); };
+      row.appendChild(now);
+    }
+    var out = cloudEl("button", "btn btn-outline btn-sm", "Sign out"); out.type = "button";
+    out.onclick = function () { cloudSignOut(); cloudCloseMenu(); };
+    row.appendChild(out);
+    m.appendChild(row);
+  }
+  function cloudToggleMenu() {
+    if (cloud.menu) { cloudCloseMenu(); return; }
+    cloud.menu = cloudEl("div", "jf-cloud-menu");
+    cloud.menu.setAttribute("role", "dialog");
+    document.body.appendChild(cloud.menu);
+    cloudFillMenu();
+  }
+
+  function cloudInit() {
+    cloud.session = cloudLoadSession();
+    var pill = cloudEl("button", "jf-cloud-pill");
+    pill.type = "button";
+    pill.setAttribute("aria-label", "Sync status");
+    pill.appendChild(cloudEl("span", "jf-cloud-dot"));
+    pill.appendChild(cloudEl("span", "jf-cloud-pill-text", ""));
+    pill.onclick = cloudToggleMenu;
+    document.body.appendChild(pill);
+    cloud.pill = pill;
+    document.addEventListener("click", function (e) {
+      if (cloud.menu && !cloud.menu.contains(e.target) && !cloud.pill.contains(e.target)) cloudCloseMenu();
+    });
+    if (!cloudSupported()) { cloudSetStatus("error", "Syncing needs the app opened from its https:// web address."); return; }
+    if (!cloud.session) { cloudSetStatus("off"); cloudShowSignIn(); }
+    else cloudSetStatus(navigator.onLine ? "syncing" : "offline");
+    window.addEventListener("online", function () { cloudSchedule(0); });
+    window.addEventListener("offline", function () { if (cloud.session) cloudSetStatus("offline"); });
+    document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible") cloudSchedule(0); });
+    setInterval(function () { if (document.visibilityState === "visible" && cloud.session) cloudSchedule(0); }, 60000);
+  }
+  cloudInit();
+  // =================== end cloud sync ===================
+
 
   render();
 })();
